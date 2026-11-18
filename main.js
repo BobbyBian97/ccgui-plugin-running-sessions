@@ -21,7 +21,22 @@ const TITLE_FETCH_TIMEOUT_MS = 8000;
 const TITLE_CACHE_CAP = 400;
 const TITLE_RETRY_COOLDOWN_MS = 60 * 1000;
 
-const TERMINAL_PHASES = new Set(["completed", "cancelled", "failed"]);
+// 外部轮次（手机 / 其他客户端经中转发起的轮次）：宿主只为本窗口发起的轮次
+// 派发 turn hooks，外部轮次没有生命周期，只能靠检测 ccgui 进程下的引擎子进程。
+// 宿主事件流仍会广播到本窗口，但插件总线不暴露原始事件、claude 也只在压缩时
+// 发 usage，拿不到开跑信号，因此进程枚举是唯一可靠的开跑来源。
+const EXTERNAL_POLL_VISIBLE_MS = 10 * 1000; // 面板挂载时
+const EXTERNAL_POLL_IDLE_MS = 60 * 1000; // 面板未挂载时降频
+const EXTERNAL_POLL_MAX_BACKOFF_MS = 5 * 60 * 1000;
+const EXTERNAL_PROBE_TIMEOUT_MS = 15000;
+const EXTERNAL_REFRESH_STALE_MS = 3000;
+// 本地 hook 轮次是更权威的同源数据：同会话仍有活动（或刚结束）的本地轮次时，
+// 进程检测结果让位，避免同一轮次出现两张卡 / 重复计数。
+const EXTERNAL_LOCAL_GRACE_MS = 15000;
+const EXTERNAL_LOCAL_START_SLACK_MS = 12000;
+const EXTERNAL_TEXT_LIMIT = 160;
+
+const TERMINAL_PHASES = new Set(["completed", "cancelled", "failed", "ended"]);
 const ACTIVE_PHASES = new Set(["running", "waiting", "settling"]);
 
 // 只有这些「后续活动/终态」事件能解除等待授权；未知 kind 与 runtime-exited 不动等待态。
@@ -55,6 +70,8 @@ const PHASE_LABELS = {
   completed: "完成",
   cancelled: "已取消",
   failed: "失败",
+  // 外部轮次只能看到进程存在与否，退出即结束（成功/失败不可知）。
+  ended: "已结束",
 };
 
 const STATUS_COLORS = {
@@ -64,6 +81,7 @@ const STATUS_COLORS = {
   completed: "#9ca3af",
   cancelled: "#9ca3af",
   failed: "var(--color-text-error-primary)",
+  ended: "#9ca3af",
 };
 
 const TEXT_PRIMARY = "var(--color-text-primary)";
@@ -219,6 +237,16 @@ const S = {
     whiteSpace: "nowrap",
   },
   statusDot: { width: 6, height: 6, borderRadius: "50%", display: "inline-block", flex: "none" },
+  externalChip: {
+    flex: "none",
+    fontSize: 10,
+    lineHeight: "16px",
+    padding: "0 6px",
+    borderRadius: 999,
+    border: BORDER,
+    color: TEXT_TERTIARY,
+    whiteSpace: "nowrap",
+  },
   unreadDot: {
     flex: "none",
     width: 7,
@@ -367,6 +395,284 @@ const TITLE_PY_SCRIPT = [
   "    rows=[{'engine':a,'session_id':b,'title':c,'custom_title':d} for a,b,c,d in con.execute(q,ids)]",
   "    con.close()",
   "sy.stdout.write(js.dumps(rows))",
+].join("\n");
+
+// 进程枚举（Windows PowerShell CIM）：从 ccgui 主进程向下收集全部子进程。
+// 引擎 CLI 由宿主逐轮 spawn（cmd shim → node cli.js 或直接 exe），完整参数都在
+// 命令行里。$pid 是 PowerShell 保留变量，循环变量一律用 $id2。
+const EXTERNAL_PS_SCRIPT = [
+  "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
+  "$ErrorActionPreference = 'Stop'",
+  "$procs = Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine,CreationDate",
+  "$byId = @{}",
+  "foreach ($p in $procs) { $byId[[int]$p.ProcessId] = $p }",
+  "$childMap = @{}",
+  "foreach ($p in $procs) {",
+  "  $pp = [int]$p.ParentProcessId",
+  "  if (-not $childMap.ContainsKey($pp)) { $childMap[$pp] = New-Object System.Collections.ArrayList }",
+  "  [void]$childMap[$pp].Add([int]$p.ProcessId)",
+  "}",
+  "$roots = @()",
+  "foreach ($p in $procs) { if ($p.Name -imatch '^ccgui') { $roots += [int]$p.ProcessId } }",
+  "$out = New-Object System.Collections.ArrayList",
+  "$seen = @{}",
+  "foreach ($r in $roots) {",
+  "  $q = New-Object System.Collections.Queue",
+  "  $q.Enqueue([int]$r)",
+  "  $seen[[int]$r] = $true",
+  "  while ($q.Count -gt 0) {",
+  "    $id2 = [int]$q.Dequeue()",
+  "    if (-not $childMap.ContainsKey($id2)) { continue }",
+  "    foreach ($c in $childMap[$id2]) {",
+  "      if ($seen.ContainsKey($c)) { continue }",
+  "      $seen[$c] = $true",
+  "      $cp = $byId[$c]",
+  "      if ($null -eq $cp) { continue }",
+  "      $startMs = 0",
+  "      try { $startMs = [long]([DateTimeOffset]$cp.CreationDate).ToUnixTimeMilliseconds() } catch { $startMs = 0 }",
+  "      [void]$out.Add([pscustomobject]@{ pid = [int]$cp.ProcessId; ppid = [int]$cp.ParentProcessId; name = [string]$cp.Name; startMs = $startMs; cmd = [string]$cp.CommandLine })",
+  "      $q.Enqueue([int]$c)",
+  "    }",
+  "  }",
+  "}",
+  "[Console]::Out.Write((ConvertTo-Json -InputObject @($out) -Compress -Depth 4))",
+].join("\n");
+
+// 外部轮次探测：在子进程里枚举进程 → 识别引擎 CLI 与会话标识 → 解析工作区。
+// 用 exec:node 授权下的 node -e 运行；宿主事件流不向插件暴露原始事件，这是
+// 唯一能拿到的「外部轮次开跑」信号。输出 [{pid,engine,sessionId,workspacePath,startedAt}]。
+export const EXTERNAL_PROBE_SCRIPT = [
+  "const g = process.getBuiltinModule;",
+  "if (!g) { process.stderr.write('node too old: getBuiltinModule missing'); process.exit(3); }",
+  "const cp = g('node:child_process');",
+  "const fs = g('fs'), os = g('os'), path = g('path');",
+  "const PS = " + JSON.stringify(EXTERNAL_PS_SCRIPT) + ";",
+  "let procs;",
+  "try {",
+  "  const raw = cp.execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', PS], { encoding: 'utf8', windowsHide: true, maxBuffer: 16777216, timeout: 15000 });",
+  "  const parsed = JSON.parse(String(raw).trim() || '[]');",
+  "  procs = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];",
+  "} catch (e) {",
+  "  process.stderr.write('probe-enum: ' + String((e && e.message) || e));",
+  "  process.exit(2);",
+  "}",
+  "const ENGINE_BY_NAME = { claude: 'claude', codex: 'codex', gemini: 'gemini', qwen: 'qwen', kimi: 'kimi', opencode: 'opencode', deepseek: 'deepseek', grok: 'grok', qodercli: 'qodercli', codebuddy: 'codebuddy', mcode: 'mcode', agy: 'agy', dsh: 'dsh' };",
+  "const NPM_SCRIPT_ENGINE = [",
+  "  [/@anthropic-ai[\\\\/]claude-code[\\\\/]/i, 'claude'],",
+  "  [/@openai[\\\\/]codex[\\\\/]/i, 'codex'],",
+  "  [/@google[\\\\/]gemini-cli[\\\\/]/i, 'gemini'],",
+  "  [/@qwen-code[\\\\/]/i, 'qwen'],",
+  "];",
+  "const EVAL_RE = /^(?:-e|--eval|-p|--print)$/;",
+  "const SKIP_EXE = /^(?:cmd\\.exe|cmd|powershell\\.exe|pwsh\\.exe|conhost\\.exe|git\\.exe|bash\\.exe|sh\\.exe|wsl\\.exe|msedgewebview2\\.exe)$/i;",
+  "function baseName(p) { const parts = String(p || '').split(/[\\\\/]+/).filter(Boolean); return (parts[parts.length - 1] || '').toLowerCase(); }",
+  "function engineOfBin(p) { const base = baseName(p).replace(/\\.(?:exe|cmd|bat|js|mjs|cjs|ps1)$/i, ''); return ENGINE_BY_NAME[base] || null; }",
+  "function takeToken(text) {",
+  "  const s = String(text || '').trimStart();",
+  "  if (!s) return { token: '', rest: '' };",
+  "  if (s[0] === '\"' || s[0] === \"'\") {",
+  "    const end = s.indexOf(s[0], 1);",
+  "    if (end < 0) return { token: s.slice(1), rest: '' };",
+  "    return { token: s.slice(1, end), rest: s.slice(end + 1) };",
+  "  }",
+  "  const m = s.match(/^\\S+/);",
+  "  const token = m ? m[0] : s;",
+  "  return { token: token, rest: s.slice(token.length) };",
+  "}",
+  "function classify(cmd) {",
+  "  const first = takeToken(cmd);",
+  "  const b0 = baseName(first.token);",
+  "  if (b0 === 'cmd.exe' || b0 === 'cmd') {",
+  "    const second = takeToken(first.rest);",
+  "    if (!/^\\/(?:c|k)$/i.test(second.token)) return null;",
+  "    const target = takeToken(second.rest);",
+  "    const engine = engineOfBin(target.token);",
+  "    if (engine) return engine;",
+  "    if (baseName(target.token).indexOf('node') === 0) {",
+  "      const script = takeToken(target.rest);",
+  "      if (EVAL_RE.test(script.token)) return null;",
+  "      for (const entry of NPM_SCRIPT_ENGINE) if (entry[0].test(script.token)) return entry[1];",
+  "    }",
+  "    return null;",
+  "  }",
+  "  if (b0 === 'node.exe' || b0 === 'node') {",
+  "    const script = takeToken(first.rest);",
+  "    if (!script.token || EVAL_RE.test(script.token)) return null;",
+  "    for (const entry of NPM_SCRIPT_ENGINE) if (entry[0].test(script.token)) return entry[1];",
+  "    return null;",
+  "  }",
+  "  if (SKIP_EXE.test(b0)) return null;",
+  "  return engineOfBin(first.token);",
+  "}",
+  "const RESUME_RES = [",
+  "  /(?:^|\\s)--resume[=\\s]+\"?([A-Za-z0-9][A-Za-z0-9._-]{5,63})\"?(?=\\s|$)/i,",
+  "  /(?:^|\\s)--session-id[=\\s]+\"?([A-Za-z0-9][A-Za-z0-9._-]{5,63})\"?(?=\\s|$)/i,",
+  "  /(?:^|\\s)--session[=\\s]+\"?([A-Za-z0-9][A-Za-z0-9._-]{5,63})\"?(?=\\s|$)/i,",
+  "  /(?:^|\\s)resume\\s+\"?([A-Za-z0-9][A-Za-z0-9._-]{5,63})\"?(?=\\s|$)/i,",
+  "];",
+  "function sessionOf(cmd) { for (const re of RESUME_RES) { const m = cmd.match(re); if (m) return m[1]; } return null; }",
+
+  "// 自身与自己的子进程（powershell 等）永远不是引擎 CLI。",
+  "const selfPids = new Set([process.pid]);",
+  "for (let changed = true; changed; ) {",
+  "  changed = false;",
+  "  for (const p of procs) if (!selfPids.has(p.pid) && selfPids.has(p.ppid)) { selfPids.add(p.pid); changed = true; }",
+  "}",
+  "const byPid = new Map();",
+  "for (const p of procs) byPid.set(p.pid, p);",
+  "const matched = [];",
+  "for (const p of procs) {",
+  "  if (selfPids.has(p.pid) || !p.cmd) continue;",
+  "  const engine = classify(p.cmd);",
+  "  if (!engine) continue;",
+  "  if (!(typeof p.startMs === 'number' && p.startMs > 0)) continue;",
+  "  matched.push({ pid: p.pid, ppid: p.ppid, startMs: p.startMs, cmd: p.cmd, engine: engine, sessionId: sessionOf(p.cmd) });",
+  "}",
+  "// cmd shim → node cli.js 是同一轮的两个包装层：祖先已匹配同引擎同会话时丢弃后代。",
+  "const matchedPids = new Set();",
+  "for (const m of matched) matchedPids.add(m.pid);",
+  "const runs = [];",
+  "for (const m of matched) {",
+  "  let cur = m;",
+  "  let covered = false;",
+  "  while (cur && byPid.has(cur.ppid)) {",
+  "    const parent = byPid.get(cur.ppid);",
+  "    if (!parent) break;",
+  "    if (matchedPids.has(parent.pid)) {",
+  "      for (const pm of matched) {",
+  "        if (pm.pid === parent.pid && pm.engine === m.engine && pm.sessionId === m.sessionId) { covered = true; break; }",
+  "      }",
+  "    }",
+  "    if (covered) break;",
+  "    cur = parent;",
+  "  }",
+  "  if (!covered) runs.push(m);",
+  "}",
+  "const HOME = os.homedir();",
+  "const DB_PATH = path.join(HOME, '.ccgui-next', 'app.db');",
+  "function sqliteCtor() { try { return g('node:sqlite').DatabaseSync; } catch (e) { return null; } }",
+  "function dbRows(ids) {",
+  "  const out = new Map();",
+  "  const DatabaseSync = sqliteCtor();",
+  "  if (!DatabaseSync || !ids.length || !fs.existsSync(DB_PATH)) return out;",
+  "  try {",
+  "    const db = new DatabaseSync(DB_PATH, { readOnly: true });",
+  "    try {",
+  "      const marks = ids.map(function () { return '?'; }).join(',');",
+  "      const stmt = db.prepare('SELECT engine, session_id, workspace_path FROM sessions WHERE session_id IN (' + marks + ')');",
+  "      for (const row of stmt.all.apply(stmt, ids)) out.set(row.session_id, row);",
+  "    } finally { db.close(); }",
+  "  } catch (e) {}",
+  "  return out;",
+  "}",
+  "function knownWorkspaces() {",
+  "  const set = new Set();",
+  "  const DatabaseSync = sqliteCtor();",
+  "  if (!DatabaseSync || !fs.existsSync(DB_PATH)) return set;",
+  "  try {",
+  "    const db = new DatabaseSync(DB_PATH, { readOnly: true });",
+  "    try { for (const row of db.prepare('SELECT path FROM workspaces').all()) if (row.path) set.add(String(row.path).toLowerCase().replace(/[\\\\/]+$/, '')); } finally { db.close(); }",
+  "  } catch (e) {}",
+  "  return set;",
+  "}",
+  "const roots = [];",
+  "try {",
+  "  for (const name of fs.readdirSync(HOME)) {",
+  "    if (name.indexOf('.claude') !== 0) continue;",
+  "    const dir = path.join(HOME, name, 'projects');",
+  "    try { if (fs.statSync(dir).isDirectory()) roots.push(dir); } catch (e) {}",
+  "  }",
+  "} catch (e) {}",
+  "function findTranscript(id) {",
+  "  for (const root of roots) {",
+  "    let dirs = [];",
+  "    try { dirs = fs.readdirSync(root); } catch (e) { continue; }",
+  "    for (const dir of dirs) {",
+  "      const file = path.join(root, dir, id + '.jsonl');",
+  "      try { if (fs.statSync(file).isFile()) return file; } catch (e) {}",
+  "    }",
+  "  }",
+  "  return null;",
+  "}",
+  "// 转录的 cwd 不一定在第一行（首行常是 queue-operation），前 64KB 逐行找。",
+  "function cwdOf(file) {",
+  "  let text = '';",
+  "  try {",
+  "    const buf = Buffer.alloc(65536);",
+  "    const fd = fs.openSync(file, 'r');",
+  "    let size = 0;",
+  "    try { size = fs.readSync(fd, buf, 0, buf.length, 0); } finally { fs.closeSync(fd); }",
+  "    text = buf.slice(0, size).toString('utf8');",
+  "  } catch (e) { return ''; }",
+  "  for (const line of text.split('\\n')) {",
+  "    if (!line) continue;",
+  "    let obj;",
+  "    try { obj = JSON.parse(line); } catch (e) { continue; }",
+  "    if (obj && typeof obj.cwd === 'string' && obj.cwd) return obj.cwd;",
+  "  }",
+  "  return '';",
+  "}",
+
+  "const ids = [];",
+  "for (const run of runs) if (run.sessionId && ids.indexOf(run.sessionId) < 0) ids.push(run.sessionId);",
+  "const rows = dbRows(ids);",
+  "for (const run of runs) {",
+  "  if (!run.sessionId) continue;",
+  "  let ws = '';",
+  "  const row = rows.get(run.sessionId);",
+  "  if (row && row.workspace_path) ws = String(row.workspace_path);",
+  "  if (!ws && run.engine === 'claude') { const file = findTranscript(run.sessionId); if (file) ws = cwdOf(file); }",
+  "  run.workspacePath = ws;",
+  "}",
+  "// 新会话首轮没有 --resume：找进程启动后新生、且 cwd 属于已知工作区的转录，",
+  "// 文件名即会话标识。只按启动时间就近配对，多个未知轮次按启动顺序分配。",
+  "const known = knownWorkspaces();",
+  "const taken = new Set(ids);",
+  "const anonymous = [];",
+  "for (const run of runs) if (!run.sessionId && run.engine === 'claude') anonymous.push(run);",
+  "if (anonymous.length) {",
+  "  const candidates = [];",
+  "  for (const root of roots) {",
+  "    let dirs = [];",
+  "    try { dirs = fs.readdirSync(root); } catch (e) { continue; }",
+  "    for (const dir of dirs) {",
+  "      let files = [];",
+  "      try { files = fs.readdirSync(path.join(root, dir)); } catch (e) { continue; }",
+  "      for (const name of files) {",
+  "        if (name.slice(-6) !== '.jsonl') continue;",
+  "        const id = name.slice(0, -6);",
+  "        if (taken.has(id)) continue;",
+  "        const file = path.join(root, dir, name);",
+  "        let st;",
+  "        try { st = fs.statSync(file); } catch (e) { continue; }",
+  "        const birth = st.birthtimeMs || st.ctimeMs || 0;",
+  "        candidates.push({ id: id, file: file, birth: birth });",
+  "      }",
+  "    }",
+  "  }",
+  "  anonymous.sort(function (a, b) { return a.startMs - b.startMs; });",
+  "  for (const run of anonymous) {",
+  "    const pool = [];",
+  "    for (const cand of candidates) {",
+  "      if (taken.has(cand.id)) continue;",
+  "      if (cand.birth < run.startMs - 3000 || cand.birth > run.startMs + 30000) continue;",
+  "      pool.push(cand);",
+  "    }",
+  "    pool.sort(function (a, b) { return Math.abs(a.birth - run.startMs) - Math.abs(b.birth - run.startMs); });",
+  "    for (const cand of pool) {",
+  "      const cwd = cwdOf(cand.file);",
+  "      if (!cwd) continue;",
+  "      if (known.size && !known.has(cwd.toLowerCase().replace(/[\\\\/]+$/, ''))) continue;",
+  "      run.sessionId = cand.id;",
+  "      run.workspacePath = cwd;",
+  "      taken.add(cand.id);",
+  "      break;",
+  "    }",
+  "  }",
+  "}",
+  "const out = [];",
+  "for (const run of runs) out.push({ pid: run.pid, engine: run.engine, sessionId: run.sessionId || null, workspacePath: run.workspacePath || '', startedAt: run.startMs });",
+  "process.stdout.write(JSON.stringify(out));",
 ].join("\n");
 
 function isText(value) {
@@ -556,9 +862,12 @@ export function ingestTurnStarted(state, payload, nowMs) {
       existing.startedAt = occurredAt;
       changed = true;
     }
+    if (existing.sessionId) changed = dropExternalForSession(state, engine, existing.sessionId) || changed;
     return changed;
   }
-  state.runs.set(key, createRun(payload, occurredAt));
+  const run = createRun(payload, occurredAt);
+  state.runs.set(key, run);
+  if (run.sessionId) dropExternalForSession(state, engine, run.sessionId);
   return true;
 }
 
@@ -598,6 +907,8 @@ export function ingestRuntimeEvent(state, payload, nowMs) {
     run.sessionId = payload.sessionId;
     changed = true;
   }
+  // 本地轮次是该会话的权威来源：同会话的外部进程记录让位（探测延迟窗口内可能已建卡）。
+  if (run.sessionId) changed = dropExternalForSession(state, engine, run.sessionId) || changed;
 
   if (isText(payload.eventId) && run.eventIds) {
     if (run.eventIds.has(payload.eventId)) return changed;
@@ -724,6 +1035,133 @@ export function ingestAfterTurn(state, payload, nowMs) {
   return true;
 }
 
+// ---- 外部轮次（进程检测） ----
+
+// 键按进程实例（pid + 启动时刻）唯一：同一会话的后续轮次是新进程，
+// 会作为新轮次进同一张会话卡，不会顶掉上一轮（含未读终态）的记录。
+export function externalRunKey(pid, startedAt) {
+  return "ext:" + pid + ":" + startedAt;
+}
+
+function createExternalRun(record, nowMs) {
+  return {
+    key: externalRunKey(record.pid, record.startedAt),
+    engine: record.engine,
+    turnId: externalRunKey(record.pid, record.startedAt),
+    runId: "",
+    sessionId: isText(record.sessionId) ? record.sessionId : null,
+    workspaceId: null,
+    workspacePath: isText(record.workspacePath) ? record.workspacePath : "",
+    startedAt: record.startedAt,
+    lastEventAt: nowMs,
+    phase: "running",
+    activity: "手机或其他客户端发起",
+    waitingTool: null,
+    waitingPath: null,
+    error: "",
+    endedAt: null,
+    read: false,
+    eventIds: new Set(),
+    source: "external",
+    pid: record.pid,
+  };
+}
+
+// 本地 hook 事件落到某会话时，进程检测出来的同会话外部轮次让位：
+// 本地轮次有真实的事件级状态，重复保留会把同一轮算成两轮。
+function dropExternalForSession(state, engine, sessionId) {
+  let changed = false;
+  for (const [key, run] of Array.from(state.runs)) {
+    if (run.source !== "external") continue;
+    if (run.engine !== engine || run.sessionId !== sessionId) continue;
+    state.runs.delete(key);
+    changed = true;
+  }
+  return changed;
+}
+
+// 应用一次成功的进程探测。只处理探测成功的调用方：探测失败时保持现状，
+// 不能把「这次没看到」当成「进程已退出」。
+export function applyExternalRuns(state, records, nowMs) {
+  if (!state || !state.runs || !Array.isArray(records)) return false;
+  const now = resolveNow(nowMs);
+  let changed = false;
+
+  const locals = [];
+  for (const run of state.runs.values()) if (run.source !== "external") locals.push(run);
+
+  function coveredByLocal(record) {
+    for (const run of locals) {
+      if (run.engine !== record.engine) continue;
+      if (record.sessionId && run.sessionId === record.sessionId) {
+        // 同会话本地轮次仍活动，或刚结束（进程可能尚未回收）：本地数据优先。
+        if (ACTIVE_PHASES.has(run.phase) || now - run.lastEventAt <= EXTERNAL_LOCAL_GRACE_MS) return true;
+        continue;
+      }
+      // 新会话首轮本地轮次可能还没拿到 sessionId：按启动时间对齐。
+      if ((!record.sessionId || !run.sessionId) && Math.abs(run.startedAt - record.startedAt) <= EXTERNAL_LOCAL_START_SLACK_MS) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  const liveKeys = new Set();
+  for (const record of records) {
+    if (!record || !isText(record.engine)) continue;
+    if (!(typeof record.pid === "number" && record.pid > 0)) continue;
+    if (!(typeof record.startedAt === "number" && record.startedAt > 0)) continue;
+
+    const key = externalRunKey(record.pid, record.startedAt);
+    liveKeys.add(key);
+    const existing = state.runs.get(key);
+    if (coveredByLocal(record)) {
+      if (existing) {
+        state.runs.delete(key);
+        changed = true;
+      }
+      continue;
+    }
+    if (existing) {
+      if (existing.phase === "ended") {
+        existing.phase = "running";
+        existing.endedAt = null;
+        existing.activity = "手机或其他客户端发起";
+        changed = true;
+      }
+      if (!existing.sessionId && isText(record.sessionId)) {
+        existing.sessionId = record.sessionId;
+        changed = true;
+      }
+      if (!existing.workspacePath && isText(record.workspacePath)) {
+        existing.workspacePath = record.workspacePath;
+        changed = true;
+      }
+      if (existing.lastEventAt < now) {
+        existing.lastEventAt = now;
+        changed = true;
+      }
+      continue;
+    }
+    state.runs.set(key, createExternalRun(record, now));
+    changed = true;
+  }
+
+  // 进程消失 = 轮次结束（键按进程实例，pid 复用也不会误续）。
+  // 外部轮次看不到退出码，只能给中性的「已结束」。
+  for (const run of Array.from(state.runs.values())) {
+    if (run.source !== "external") continue;
+    if (run.phase !== "running") continue;
+    if (liveKeys.has(run.key)) continue;
+    run.phase = "ended";
+    run.endedAt = now;
+    run.activity = "外部轮次已结束";
+    changed = true;
+  }
+
+  return changed;
+}
+
 export function pruneRuns(state, nowMs) {
   if (!state || !state.runs) return false;
   const now = resolveNow(nowMs);
@@ -783,18 +1221,21 @@ function aggregatePhase(runs) {
   let hasSettling = false;
   let hasFailed = false;
   let hasCancelled = false;
+  let hasEnded = false;
   for (const run of runs) {
     if (run.phase === "waiting") hasWaiting = true;
     else if (run.phase === "running") hasRunning = true;
     else if (run.phase === "settling") hasSettling = true;
     else if (run.phase === "failed") hasFailed = true;
     else if (run.phase === "cancelled") hasCancelled = true;
+    else if (run.phase === "ended") hasEnded = true;
   }
   if (hasWaiting) return "waiting";
   if (hasRunning) return "running";
   if (hasSettling) return "settling";
   if (hasFailed) return "failed";
   if (hasCancelled) return "cancelled";
+  if (hasEnded) return "ended";
   return "completed";
 }
 
@@ -877,9 +1318,12 @@ export function deriveCards(state, nowMs) {
     }
     // 卡内只要还有未读轮次，整卡就是未读（新轮次会让已读会话重新变未读）。
     const unread = runs.some((run) => run.read !== true);
+    // 代表轮次来自进程检测（手机 / 其他客户端）：状态粒度只到进程级。
+    const external = representative.source === "external";
     cards.push({
       key,
       unread,
+      external,
       engine: runs[0].engine,
       engineLabel: engineLabel(runs[0].engine),
       sessionId,
@@ -1025,6 +1469,16 @@ export function createSessionStore(options) {
     turnFinished(payload) {
       commit(ingestAfterTurn(state, payload, nowFn()));
     },
+    // 进程探测结果（只在探测成功时调用）。
+    applyExternalRuns(records, nowMs) {
+      const changed = applyExternalRuns(state, records, nowMs);
+      commit(changed);
+      return changed;
+    },
+    // 面板未挂载时降频轮询，避免无谓地反复 spawn 探测子进程。
+    hasSubscribers() {
+      return subscribers.size > 0;
+    },
     // 标记整卡已读（打开会话或点「标为已读」）；已读终态轮次随清理窗消失。
     markRead(cardKey) {
       commit(markCardRead(state, cardKey));
@@ -1152,6 +1606,92 @@ export default function activate(ctx) {
 
   const titlePollTimer = canFetchTitles ? setInterval(() => scheduleTitleSync(0), TITLE_TTL_MS) : null;
 
+  // ---- 外部轮次：探测 ccgui 子进程里的引擎 CLI（手机 / 其他客户端发起的轮次） ----
+  // 宿主只为本窗口发起的轮次派发 turn hooks，外部轮次没有生命周期；这里用
+  // exec 授权枚举进程补上开跑/结束信号（结果只是进程级，比 hook 轮次粗）。
+  const externalSync = { timer: null, busy: false, lastAt: 0, failures: 0 };
+
+  function externalNextDelay() {
+    const base = store.hasSubscribers() ? EXTERNAL_POLL_VISIBLE_MS : EXTERNAL_POLL_IDLE_MS;
+    if (externalSync.failures === 0) return base;
+    return Math.min(base * Math.pow(2, externalSync.failures), EXTERNAL_POLL_MAX_BACKOFF_MS);
+  }
+
+  function scheduleExternalPoll(delay) {
+    if (!canFetchTitles || externalSync.timer !== null) return;
+    const wait = typeof delay === "number" && delay >= 0 ? delay : externalNextDelay();
+    externalSync.timer = setTimeout(() => {
+      externalSync.timer = null;
+      void pollExternal();
+    }, wait);
+  }
+
+  // 面板打开 / 窗口回到前台：数据确实陈旧才立刻补探一次。
+  function requestExternalRefresh() {
+    if (!canFetchTitles) return;
+    if (Date.now() - externalSync.lastAt < EXTERNAL_REFRESH_STALE_MS) return;
+    if (externalSync.timer !== null) {
+      clearTimeout(externalSync.timer);
+      externalSync.timer = null;
+    }
+    scheduleExternalPoll(0);
+  }
+
+  async function queryExternalRuns() {
+    const result = await ctx.bridge.invoke("plugin_exec_run", {
+      bin: "node",
+      args: ["-e", EXTERNAL_PROBE_SCRIPT],
+      timeoutMs: EXTERNAL_PROBE_TIMEOUT_MS,
+    });
+    if (!result || result.code !== 0 || typeof result.stdout !== "string") return null;
+    let rows;
+    try {
+      rows = JSON.parse(result.stdout);
+    } catch {
+      return null;
+    }
+    return Array.isArray(rows) ? rows : null;
+  }
+
+  async function pollExternal() {
+    if (!canFetchTitles || externalSync.busy) return;
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      scheduleExternalPoll(EXTERNAL_POLL_VISIBLE_MS);
+      return;
+    }
+    externalSync.busy = true;
+    let rows = null;
+    try {
+      rows = await queryExternalRuns();
+    } catch {
+      rows = null;
+    } finally {
+      externalSync.busy = false;
+    }
+    if (rows === null) {
+      // 非 Windows / 没有 Node / 授权被拒：指数退避，不刷屏。
+      externalSync.failures = Math.min(externalSync.failures + 1, 5);
+    } else {
+      externalSync.failures = 0;
+      externalSync.lastAt = Date.now();
+      // 外部轮次也可能带来新会话标识：补一次标题查询（TTL 内不会重复 spawn）。
+      if (store.applyExternalRuns(rows, externalSync.lastAt)) scheduleTitleSync(500);
+    }
+    scheduleExternalPoll();
+  }
+
+  function handleExternalVisibility() {
+    if (typeof document === "undefined" || document.visibilityState === "hidden") return;
+    requestExternalRefresh();
+  }
+
+  const canListenVisibility =
+    typeof document !== "undefined" && typeof document.addEventListener === "function";
+  if (canFetchTitles) {
+    if (canListenVisibility) document.addEventListener("visibilitychange", handleExternalVisibility);
+    scheduleExternalPoll(2000);
+  }
+
   function useStoreRevision() {
     const [revision, setRevision] = useState(0);
     useEffect(
@@ -1221,9 +1761,10 @@ export default function activate(ctx) {
       []
     );
 
-    // 面板一打开就补一次标题（页面重载后内存缓存为空）。
+    // 面板一打开就补一次标题（页面重载后内存缓存为空），并补一次进程探测。
     useEffect(() => {
       scheduleTitleSync(0);
+      requestExternalRefresh();
     }, []);
 
     const nowMs = Date.now();
@@ -1293,6 +1834,7 @@ export default function activate(ctx) {
         (card.titleText ? " · 标题：" + card.titleText : "") +
         " · " +
         card.phaseLabel +
+        (card.external ? " · 手机或其他客户端发起" : "") +
         (card.runCount > 1 ? " · " + card.runCount + " 个轮次" : "") +
         " · " +
         elapsedLabel +
@@ -1345,6 +1887,16 @@ export default function activate(ctx) {
             h("span", { style: Object.assign({}, S.statusDot, { background: statusColor, opacity: dotOpacity }) }),
             card.phaseLabel
           ),
+          card.external
+            ? h(
+                "span",
+                {
+                  style: S.externalChip,
+                  title: "手机或其他客户端发起：本窗口没有该轮次的事件，状态按引擎进程推断",
+                },
+                "外部"
+              )
+            : null,
           card.unread && (TERMINAL_PHASES.has(card.phase) || card.phase === "settling")
             ? h("span", { style: S.unreadChip }, "未读")
             : null,
@@ -1388,7 +1940,7 @@ export default function activate(ctx) {
           { style: S.titleRow },
           h("span", { style: S.title }, "运行中会话"),
           h("span", { style: S.countChip }, activeCount + " 个运行中"),
-          h("span", { style: S.scopeChip }, "全部项目 · 本窗口")
+          h("span", { style: S.scopeChip }, "全部项目 · 含外部客户端")
         )
       ),
       bannerMessage
@@ -1419,14 +1971,18 @@ export default function activate(ctx) {
               { style: S.empty },
               h("div", { style: S.emptyTitle }, "当前没有正在执行的会话"),
               h("div", { style: S.emptyDesc }, "在任意项目发送消息后，正在执行的轮次会出现在这里。"),
-              h("div", { style: S.emptyNote }, "数据来自本窗口的运行事件：插件加载或页面重载前已开始的轮次不会显示。")
+              h(
+                "div",
+                { style: S.emptyNote },
+                "数据来自本窗口的运行事件与桌面引擎进程：手机或其他客户端发起的轮次也会显示（约 10 秒内出现）。"
+              )
             )
       ),
       h(
         "div",
         { style: S.footer },
-        h("div", { style: S.footerLine }, "更新于 " + formatClock(store.getLastChangedAt()) + " · 所有项目 · 仅本窗口"),
-        h("div", { style: S.footerNote }, "插件加载/页面重载前已在执行的轮次可能不显示")
+        h("div", { style: S.footerLine }, "更新于 " + formatClock(store.getLastChangedAt()) + " · 所有项目 · 含外部客户端"),
+        h("div", { style: S.footerNote }, "「外部」轮次按引擎进程推断，只区分运行/结束；插件加载前已结束的轮次不会显示")
       )
     );
   }
@@ -1461,6 +2017,11 @@ export default function activate(ctx) {
       clearTimeout(titleSync.timer);
       titleSync.timer = null;
     }
+    if (externalSync.timer !== null) {
+      clearTimeout(externalSync.timer);
+      externalSync.timer = null;
+    }
+    if (canFetchTitles && canListenVisibility) document.removeEventListener("visibilitychange", handleExternalVisibility);
     if (titlePollTimer !== null) clearInterval(titlePollTimer);
     store.dispose();
   };
