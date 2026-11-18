@@ -1628,13 +1628,25 @@ export default function activate(ctx) {
 
   // 面板打开 / 窗口回到前台：数据确实陈旧才立刻补探一次。
   function requestExternalRefresh() {
-    if (!canFetchTitles) return;
-    if (Date.now() - externalSync.lastAt < EXTERNAL_REFRESH_STALE_MS) return;
+    if (externalSync.disposed || !canFetchTitles) return;
+    const fresh = Date.now() - externalSync.lastAt < EXTERNAL_REFRESH_STALE_MS;
+    if (!fresh) {
+      // 探测失败退避期间不插队重试，保留原有退避节奏。
+      if (externalSync.failures > 0) return;
+      if (externalSync.timer !== null) {
+        clearTimeout(externalSync.timer);
+        externalSync.timer = null;
+      }
+      scheduleExternalPoll(0);
+      return;
+    }
+    // 数据还新鲜：不重复探测，但把下一次轮询切到当前订阅状态对应的节奏，
+    // 免得面板刚打开还沿用未挂载时的 60 秒间隔。
     if (externalSync.timer !== null) {
       clearTimeout(externalSync.timer);
       externalSync.timer = null;
     }
-    scheduleExternalPoll(0);
+    scheduleExternalPoll();
   }
 
   async function queryExternalRuns() {
@@ -1653,12 +1665,11 @@ export default function activate(ctx) {
     return Array.isArray(rows) ? rows : null;
   }
 
+  // 注意：窗口最小化 / 锁屏时也照常探测。用户离开桌面用手机发消息时窗口往往
+  // 正处于隐藏态，跳过探测会漏掉整段只在手机侧执行的轮次；探测本身开销很小
+  // （墙钟 ~2.4s 主要是在等 WMI，CPU 仅 ~0.14s），隐藏页的定时器节流也会兜底降频。
   async function pollExternal() {
     if (!canFetchTitles || externalSync.busy) return;
-    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
-      scheduleExternalPoll(EXTERNAL_POLL_VISIBLE_MS);
-      return;
-    }
     externalSync.busy = true;
     let rows = null;
     try {
@@ -1893,7 +1904,7 @@ export default function activate(ctx) {
                 "span",
                 {
                   style: S.externalChip,
-                  title: "手机或其他客户端发起：本窗口没有该轮次的事件，状态按引擎进程推断",
+                  title: "本插件实例没有该轮次的事件（手机/其他客户端发起，或插件加载前已在执行）：状态按引擎进程推断",
                 },
                 "外部"
               )

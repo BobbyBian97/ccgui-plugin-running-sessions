@@ -1,7 +1,7 @@
 {
   "id": "running-sessions",
   "name": "运行中会话",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "tier": "js",
   "author": "zbbian",
   "description": "在右侧面板实时回显所有项目中正在执行的会话（含手机/其他客户端发起的轮次、会话标题、已读/未读），可点击跳转；未读会话结束后仍保留，已读且结束后消失。",
