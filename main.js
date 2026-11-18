@@ -462,9 +462,110 @@ const EXTERNAL_PS_SCRIPT = [
   "[Console]::Out.Write((ConvertTo-Json -InputObject @($out) -Compress -Depth 4))",
 ].join("\n");
 
+// 转录判活共享源：外部轮次原本只看进程存在与否，但宿主用 stream-json 常驻进程
+// 承载会话，进程还在 ≠ 回合还在跑——实测回合结束 2.6 小时后 cmd/node 进程仍滞留、
+// CPU 0，面板会把早已结束的会话一直显示成「运行中」，标为已读也不会消失。
+// 以转录尾部为准：最后一条有效记录是 assistant 的 end_turn 终结消息 → 回合已结束；
+// 其余（真实用户输入、tool_result、待执行/待接续的 tool_use、流式中的助手内容）→ 在跑。
+// 读不到转录时返回 null，调用方维持原判（按进程存在处理）。
+const TRANSCRIPT_LIVENESS_SOURCE = [
+  "const TURN_CAVEAT_RE = /local-command-caveat|<command-name>|<local-command-stdout>/;",
+  "function turnState(file) {",
+  "  let fd = null, size = 0;",
+  "  try { fd = fs.openSync(file, 'r'); size = fs.fstatSync(fd).size; } catch (e) { return null; }",
+  "  try {",
+  "    const length = Math.min(size, " + QUESTION_TAIL_BYTES + ");",
+  "    const start = size - length;",
+  "    const buf = Buffer.alloc(length);",
+  "    let read = 0;",
+  "    try { read = fs.readSync(fd, buf, 0, length, start); } catch (e) { return null; }",
+  "    let text = buf.slice(0, read).toString('utf8');",
+  "    // 从文件中部开始：第一行多半是半行，丢掉。",
+  "    if (start > 0) { const nl = text.indexOf('\\n'); text = nl < 0 ? '' : text.slice(nl + 1); }",
+  "    const lines = text.split('\\n').filter(Boolean);",
+  "    let active = null;",
+  "    let startedAt = 0;",
+  "    for (const line of lines) {",
+  "      let obj;",
+  "      try { obj = JSON.parse(line); } catch (e) { continue; }",
+  "      if (!obj || typeof obj !== 'object' || obj.isSidechain) continue;",
+  "      const type = obj.type;",
+  "      if (type !== 'assistant' && type !== 'user') continue;",
+  "      const msg = obj.message;",
+  "      if (!msg) continue;",
+  "      const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;",
+  "      if (type === 'assistant') {",
+  "        if (msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;",
+  "        let hasTool = false;",
+  "        for (const block of msg.content) if (block && block.type === 'tool_use') hasTool = true;",
+  "        active = msg.stop_reason === 'end_turn' && !hasTool ? false : true;",
+  "        continue;",
+  "      }",
+  "      if (obj.isMeta || msg.role !== 'user') continue;",
+  "      if (typeof msg.content === 'string') {",
+  "        const t = msg.content.trim();",
+  "        if (t && !TURN_CAVEAT_RE.test(t)) { active = true; if (isFinite(ts)) startedAt = ts; }",
+  "        continue;",
+  "      }",
+  "      if (!Array.isArray(msg.content)) continue;",
+  "      let realText = false;",
+  "      for (const block of msg.content) {",
+  "        if (!block || typeof block !== 'object') continue;",
+  "        if (block.type === 'tool_result') active = true;",
+  "        else if (block.type === 'text' && typeof block.text === 'string' && block.text.trim() && !TURN_CAVEAT_RE.test(block.text)) { realText = true; active = true; }",
+  "      }",
+  "      if (realText && isFinite(ts)) startedAt = ts;",
+  "    }",
+  "    return { active: active === null ? true : active, startedAt: startedAt };",
+  "  } finally { fs.closeSync(fd); }",
+  "}",
+];
+
+// 独立探针（便于调试/测试）：按会话 id 输出转录判活结果。
+// 输出 [{sessionId,file,active,startedAt}]；读不到转录的会话不出现。
+export const TURN_STATE_SCRIPT = [
+  "const g = process.getBuiltinModule;",
+  "if (!g) { process.stderr.write('node too old: getBuiltinModule missing'); process.exit(3); }",
+  "const fs = g('fs'), os = g('os'), path = g('path');",
+  "const ids = JSON.parse(process.argv[1] || '[]');",
+  ...TRANSCRIPT_LIVENESS_SOURCE,
+  "const home = os.homedir();",
+  "const roots = [];",
+  "try {",
+  "  for (const name of fs.readdirSync(home)) {",
+  "    if (name.indexOf('.claude') !== 0) continue;",
+  "    const dir = path.join(home, name, 'projects');",
+  "    try { if (fs.statSync(dir).isDirectory()) roots.push(dir); } catch (e) {}",
+  "  }",
+  "} catch (e) {}",
+  "function isFile(file) { try { return fs.statSync(file).isFile(); } catch (e) { return false; } }",
+  "function findTranscript(id) {",
+  "  for (const root of roots) {",
+  "    let dirs = [];",
+  "    try { dirs = fs.readdirSync(root); } catch (e) { continue; }",
+  "    for (const dir of dirs) {",
+  "      const file = path.join(root, dir, id + '.jsonl');",
+  "      if (isFile(file)) return file;",
+  "    }",
+  "  }",
+  "  return null;",
+  "}",
+  "const out = [];",
+  "for (const id of ids) {",
+  "  if (typeof id !== 'string' || !id) continue;",
+  "  const file = findTranscript(id);",
+  "  if (!file) continue;",
+  "  const state = turnState(file);",
+  "  if (!state) continue;",
+  "  out.push({ sessionId: id, file: file, active: state.active, startedAt: state.startedAt });",
+  "}",
+  "process.stdout.write(JSON.stringify(out));",
+].join("\n");
+
 // 外部轮次探测：在子进程里枚举进程 → 识别引擎 CLI 与会话标识 → 解析工作区。
 // 用 exec:node 授权下的 node -e 运行；宿主事件流不向插件暴露原始事件，这是
-// 唯一能拿到的「外部轮次开跑」信号。输出 [{pid,engine,sessionId,workspacePath,startedAt}]。
+// 唯一能拿到的「外部轮次开跑」信号。输出
+// [{pid,engine,sessionId,workspacePath,startedAt,turnStartedAt}]。
 export const EXTERNAL_PROBE_SCRIPT = [
   "const g = process.getBuiltinModule;",
   "if (!g) { process.stderr.write('node too old: getBuiltinModule missing'); process.exit(3); }",
@@ -636,6 +737,7 @@ export const EXTERNAL_PROBE_SCRIPT = [
   "  }",
   "  return '';",
   "}",
+  ...TRANSCRIPT_LIVENESS_SOURCE,
 
   "const ids = [];",
   "for (const run of runs) if (run.sessionId && ids.indexOf(run.sessionId) < 0) ids.push(run.sessionId);",
@@ -689,13 +791,29 @@ export const EXTERNAL_PROBE_SCRIPT = [
   "      if (known.size && !known.has(cwd.toLowerCase().replace(/[\\\\/]+$/, ''))) continue;",
   "      run.sessionId = cand.id;",
   "      run.workspacePath = cwd;",
+  "      run.transcriptFile = cand.file;",
   "      taken.add(cand.id);",
   "      break;",
   "    }",
   "  }",
   "}",
+  "// 常驻进程判活：转录尾部说回合已结束的 claude 进程不算在跑（进程可能滞留）。",
+  "// 读不到转录（新会话尚未落盘等）时维持原判，按进程存在处理。",
+  "for (const run of runs) {",
+  "  if (run.engine !== 'claude') continue;",
+  "  let file = run.transcriptFile || '';",
+  "  if (!file && run.sessionId) file = findTranscript(run.sessionId);",
+  "  if (!file) continue;",
+  "  const state = turnState(file);",
+  "  if (!state) continue;",
+  "  run.turnActive = state.active;",
+  "  if (state.startedAt > 0) run.turnStartedAt = state.startedAt;",
+  "}",
   "const out = [];",
-  "for (const run of runs) out.push({ pid: run.pid, engine: run.engine, sessionId: run.sessionId || null, workspacePath: run.workspacePath || '', startedAt: run.startMs });",
+  "for (const run of runs) {",
+  "  if (run.turnActive === false) continue;",
+  "  out.push({ pid: run.pid, engine: run.engine, sessionId: run.sessionId || null, workspacePath: run.workspacePath || '', startedAt: run.startMs, turnStartedAt: run.turnStartedAt || 0 });",
+  "}",
   "process.stdout.write(JSON.stringify(out));",
 ].join("\n");
 
@@ -1227,6 +1345,14 @@ export function externalRunKey(pid, startedAt) {
   return "ext:" + pid + ":" + startedAt;
 }
 
+// 计时起点用转录给出的当前回合开始时刻（常驻进程可能已经跑过好几轮，
+// 进程启动时刻会把时长算成几小时）；转录读不到时退回进程启动时刻。
+function turnStartOf(record) {
+  return typeof record.turnStartedAt === "number" && record.turnStartedAt > 0
+    ? record.turnStartedAt
+    : record.startedAt;
+}
+
 function createExternalRun(record, nowMs) {
   return {
     key: externalRunKey(record.pid, record.startedAt),
@@ -1236,7 +1362,7 @@ function createExternalRun(record, nowMs) {
     sessionId: isText(record.sessionId) ? record.sessionId : null,
     workspaceId: null,
     workspacePath: isText(record.workspacePath) ? record.workspacePath : "",
-    startedAt: record.startedAt,
+    startedAt: turnStartOf(record),
     lastEventAt: nowMs,
     phase: "running",
     activity: "手机或其他客户端发起",
@@ -1284,8 +1410,8 @@ export function applyExternalRuns(state, records, nowMs) {
         if (ACTIVE_PHASES.has(run.phase) || now - run.lastEventAt <= EXTERNAL_LOCAL_GRACE_MS) return true;
         continue;
       }
-      // 新会话首轮本地轮次可能还没拿到 sessionId：按启动时间对齐。
-      if ((!record.sessionId || !run.sessionId) && Math.abs(run.startedAt - record.startedAt) <= EXTERNAL_LOCAL_START_SLACK_MS) {
+      // 新会话首轮本地轮次可能还没拿到 sessionId：按回合启动时间对齐。
+      if ((!record.sessionId || !run.sessionId) && Math.abs(run.startedAt - turnStartOf(record)) <= EXTERNAL_LOCAL_START_SLACK_MS) {
         return true;
       }
     }
@@ -1309,12 +1435,22 @@ export function applyExternalRuns(state, records, nowMs) {
       continue;
     }
     if (existing) {
+      // 常驻进程重新开跑（上一回合已结束、这次转录又是在跑）：按新一轮处理。
       if (existing.phase === "ended") {
         existing.phase = "running";
         existing.endedAt = null;
+        existing.startedAt = turnStartOf(record);
         existing.activity = "手机或其他客户端发起";
         existing.askKind = null;
         existing.askText = "";
+        existing.read = false;
+        changed = true;
+      }
+      // 同一进程连着跑新回合（探测间隔内没看到空闲缝）：只把计时起点前移。
+      // 进程启动时刻用于键，startedAt 只影响展示与本地轮次对齐。
+      const turnStart = turnStartOf(record);
+      if (turnStart > existing.startedAt) {
+        existing.startedAt = turnStart;
         changed = true;
       }
       if (!existing.sessionId && isText(record.sessionId)) {
