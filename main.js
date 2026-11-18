@@ -36,8 +36,19 @@ const EXTERNAL_LOCAL_GRACE_MS = 15000;
 const EXTERNAL_LOCAL_START_SLACK_MS = 12000;
 const EXTERNAL_TEXT_LIMIT = 160;
 
+// 待回复（模型提问 / 计划审批）：宿主插件总线不下发 question / plan_review 事件
+// （normalized runtime events 里没有这两类，plan_review 系列在宿主内部被跳过），
+// 所以只能由插件在面板打开时读 Claude 转录尾部，判断最新一次 AskUserQuestion /
+// ExitPlanMode 是否还缺少回答证据。只覆盖 claude 引擎；探测成本只是读几百 KB 文件。
+const QUESTION_POLL_MS = 10 * 1000; // 面板挂载且有候选轮次时的节奏
+const QUESTION_REFRESH_STALE_MS = 3000;
+const QUESTION_FETCH_TIMEOUT_MS = 8000;
+const QUESTION_TAIL_BYTES = 262144;
+const QUESTION_TARGET_CAP = 24;
+const QUESTION_TEXT_LIMIT = 200;
+
 const TERMINAL_PHASES = new Set(["completed", "cancelled", "failed", "ended"]);
-const ACTIVE_PHASES = new Set(["running", "waiting", "settling"]);
+const ACTIVE_PHASES = new Set(["running", "waiting", "asking", "settling"]);
 
 // 只有这些「后续活动/终态」事件能解除等待授权；未知 kind 与 runtime-exited 不动等待态。
 const CLEARS_WAITING = new Set([
@@ -66,6 +77,8 @@ const ENGINE_LABELS = {
 const PHASE_LABELS = {
   running: "运行中",
   waiting: "等待授权",
+  // 模型提问 / 计划审批：需要用户回复或确认，与「等待授权」是两种独立状态。
+  asking: "待回复",
   settling: "正在收尾",
   completed: "完成",
   cancelled: "已取消",
@@ -77,6 +90,7 @@ const PHASE_LABELS = {
 const STATUS_COLORS = {
   running: "#22c55e",
   waiting: "#f59e0b",
+  asking: "#8b5cf6",
   settling: "#9ca3af",
   completed: "#9ca3af",
   cancelled: "#9ca3af",
@@ -263,6 +277,16 @@ const S = {
     borderRadius: 999,
     background: "rgba(59, 130, 246, 0.14)",
     color: "#3b82f6",
+    whiteSpace: "nowrap",
+  },
+  askingChip: {
+    flex: "none",
+    fontSize: 11,
+    padding: "1px 8px",
+    borderRadius: 999,
+    border: "1px solid rgba(139, 92, 246, 0.55)",
+    background: "rgba(139, 92, 246, 0.12)",
+    color: "#8b5cf6",
     whiteSpace: "nowrap",
   },
   markReadBtn: {
@@ -675,6 +699,155 @@ export const EXTERNAL_PROBE_SCRIPT = [
   "process.stdout.write(JSON.stringify(out));",
 ].join("\n");
 
+// 待回复探测：对每个活动会话读 Claude 转录尾部，找最新一次 AskUserQuestion /
+// ExitPlanMode 的 tool_use，判断它之后有没有回答证据：
+//   · 命中同一 tool_use_id 的 tool_result；
+//   · 一条真实的用户文本行（排除 meta / 本地命令回显）；
+//   · 之后又出现助手内容（模型已继续执行）。
+// 只有明确证据才判为「已回答」；转录缺失/读失败的行直接不出现在输出里，
+// 调用方据此保留现状，不把「这次没看到」当成「已回复」。
+// 输出 [{sessionId, pending, kind:'question'|'plan'|'', text}]。
+export const QUESTION_PROBE_SCRIPT = [
+  "const g = process.getBuiltinModule;",
+  "if (!g) { process.stderr.write('node too old: getBuiltinModule missing'); process.exit(3); }",
+  "const fs = g('fs'), os = g('os'), path = g('path');",
+  "const ids = JSON.parse(process.argv[1] || '[]');",
+  "const TAIL = " + QUESTION_TAIL_BYTES + ", LINE_CAP = 4000;",
+  "const home = os.homedir();",
+  "const roots = [];",
+  "try {",
+  "  for (const name of fs.readdirSync(home)) {",
+  "    if (name.indexOf('.claude') !== 0) continue;",
+  "    const dir = path.join(home, name, 'projects');",
+  "    try { if (fs.statSync(dir).isDirectory()) roots.push(dir); } catch (e) {}",
+  "  }",
+  "} catch (e) {}",
+  "// 宿主会话库直接给出转录路径；库不可用/路径失效时按会话 id 扫 .claude* 目录。",
+  "const dbFiles = new Map();",
+  "try {",
+  "  const dbPath = path.join(home, '.ccgui-next', 'app.db');",
+  "  const DatabaseSync = g('node:sqlite').DatabaseSync;",
+  "  if (DatabaseSync && ids.length && fs.existsSync(dbPath)) {",
+  "    const db = new DatabaseSync(dbPath, { readOnly: true });",
+  "    try {",
+  "      const stmt = db.prepare('SELECT file_path FROM sessions WHERE session_id = ?');",
+  "      for (const id of ids) {",
+  "        if (typeof id !== 'string' || !id) continue;",
+  "        const row = stmt.get(id);",
+  "        if (row && typeof row.file_path === 'string' && row.file_path) dbFiles.set(id, row.file_path);",
+  "      }",
+  "    } finally { db.close(); }",
+  "  }",
+  "} catch (e) {}",
+  "function isFile(file) { try { return fs.statSync(file).isFile(); } catch (e) { return false; } }",
+  "function findTranscript(id) {",
+  "  const known = dbFiles.get(id);",
+  "  if (known && isFile(known)) return known;",
+  "  for (const root of roots) {",
+  "    let dirs = [];",
+  "    try { dirs = fs.readdirSync(root); } catch (e) { continue; }",
+  "    for (const dir of dirs) {",
+  "      const file = path.join(root, dir, id + '.jsonl');",
+  "      if (isFile(file)) return file;",
+  "    }",
+  "  }",
+  "  return null;",
+  "}",
+  "function tailLines(file) {",
+  "  let fd = null, size = 0;",
+  "  try { fd = fs.openSync(file, 'r'); size = fs.fstatSync(fd).size; } catch (e) { return null; }",
+  "  try {",
+  "    const length = Math.min(size, TAIL);",
+  "    const start = size - length;",
+  "    const buf = Buffer.alloc(length);",
+  "    let read = 0;",
+  "    try { read = fs.readSync(fd, buf, 0, length, start); } catch (e) { return null; }",
+  "    let text = buf.slice(0, read).toString('utf8');",
+  "    // 从文件中部开始时第一行常是半行：丢掉，避免 JSON 解析噪声。",
+  "    if (start > 0) { const nl = text.indexOf('\\n'); text = nl < 0 ? '' : text.slice(nl + 1); }",
+  "    const lines = text.split('\\n').filter(Boolean);",
+  "    return lines.length > LINE_CAP ? lines.slice(lines.length - LINE_CAP) : lines;",
+  "  } finally { fs.closeSync(fd); }",
+  "}",
+  "const CAVEAT_RE = /local-command-caveat|<command-name>|<local-command-stdout>/;",
+  "function questionText(kind, input) {",
+  "  if (!input || typeof input !== 'object') return '';",
+  "  if (kind === 'plan') {",
+  "    const plan = typeof input.plan === 'string' ? input.plan : '';",
+  "    for (const raw of plan.split(/\\r?\\n/)) {",
+  "      const line = raw.replace(/^[#>*\\-\\s]+/, '').trim();",
+  "      if (line) return line.slice(0, 300);",
+  "    }",
+  "    return typeof input.planFilePath === 'string' ? path.basename(input.planFilePath) : '';",
+  "  }",
+  "  const list = Array.isArray(input.questions) ? input.questions : [];",
+  "  for (const q of list) {",
+  "    if (q && typeof q.question === 'string' && q.question.trim()) return q.question.trim().slice(0, 300);",
+  "    if (q && typeof q.header === 'string' && q.header.trim()) return q.header.trim().slice(0, 300);",
+  "  }",
+  "  return '';",
+  "}",
+  "function analyze(file) {",
+  "  const lines = tailLines(file);",
+  "  if (lines === null) return null;",
+  "  let cand = null;",
+  "  let answered = false;",
+  "  for (const line of lines) {",
+  "    let obj;",
+  "    try { obj = JSON.parse(line); } catch (e) { continue; }",
+  "    if (!obj || typeof obj !== 'object') continue;",
+  "    if (obj.isSidechain) continue;",
+  "    const type = obj.type;",
+  "    if (type !== 'assistant' && type !== 'user') continue;",
+  "    const msg = obj.message;",
+  "    if (!msg) continue;",
+  "    if (type === 'assistant') {",
+  "      if (msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;",
+  "      for (const block of msg.content) {",
+  "        if (!block || typeof block !== 'object') continue;",
+  "        if (block.type === 'tool_use' && (block.name === 'AskUserQuestion' || block.name === 'ExitPlanMode')) {",
+  "          const kind = block.name === 'ExitPlanMode' ? 'plan' : 'question';",
+  "          cand = { kind: kind, id: typeof block.id === 'string' ? block.id : '', text: questionText(kind, block.input) };",
+  "          answered = false;",
+  "          continue;",
+  "        }",
+  "        if (cand && (block.type === 'text' || block.type === 'tool_use' || block.type === 'thinking')) answered = true;",
+  "      }",
+  "      continue;",
+  "    }",
+  "    if (obj.isMeta || msg.role !== 'user') continue;",
+  "    if (typeof msg.content === 'string') {",
+  "      const text = msg.content.trim();",
+  "      if (text && !CAVEAT_RE.test(text)) answered = true;",
+  "      continue;",
+  "    }",
+  "    if (!Array.isArray(msg.content)) continue;",
+  "    for (const block of msg.content) {",
+  "      if (!block || typeof block !== 'object') continue;",
+  "      if (block.type === 'tool_result') {",
+  "        if (cand && block.tool_use_id === cand.id) answered = true;",
+  "      } else if (block.type === 'text' && typeof block.text === 'string' && block.text.trim() && !CAVEAT_RE.test(block.text)) {",
+  "        answered = true;",
+  "      }",
+  "    }",
+  "  }",
+  "  if (!cand) return { pending: false, kind: '', text: '' };",
+  "  return { pending: !answered, kind: cand.kind, text: cand.text };",
+  "}",
+  "const out = [];",
+  "const seen = new Set();",
+  "for (const id of ids) {",
+  "  if (typeof id !== 'string' || !id || seen.has(id)) continue;",
+  "  seen.add(id);",
+  "  const file = findTranscript(id);",
+  "  if (!file) continue;",
+  "  const result = analyze(file);",
+  "  if (!result) continue;",
+  "  out.push({ sessionId: id, pending: result.pending, kind: result.kind, text: result.text });",
+  "}",
+  "process.stdout.write(JSON.stringify(out));",
+].join("\n");
+
 function isText(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -830,6 +1003,9 @@ function createRun(payload, occurredAt) {
     activity: "已开始执行",
     waitingTool: null,
     waitingPath: null,
+    // 待回复（提问 / 计划审批）由转录探测补写；kind: "question" | "plan"。
+    askKind: null,
+    askText: "",
     error: "",
     endedAt: null,
     read: false,
@@ -925,9 +1101,12 @@ export function ingestRuntimeEvent(state, payload, nowMs) {
   const kind = isText(payload.kind) ? payload.kind : "";
   if (CLEARS_WAITING.has(kind)) {
     // 等待授权只被确证的后续活动/终态解除；未知 kind、runtime-exited 保持等待态。
+    // 待回复同理：引擎产生任何后续活动，说明提问/计划确认已经过去。
     run.waitingTool = null;
     run.waitingPath = null;
-    if (run.phase === "waiting") run.phase = "running";
+    run.askKind = null;
+    run.askText = "";
+    if (run.phase === "waiting" || run.phase === "asking") run.phase = "running";
   }
   run.lastEventAt = Math.max(run.lastEventAt, occurredAt);
   changed = true;
@@ -937,6 +1116,9 @@ export function ingestRuntimeEvent(state, payload, nowMs) {
       run.phase = "waiting";
       run.waitingTool = isText(payload.tool) ? payload.tool : null;
       run.waitingPath = isText(payload.path) ? payload.path : null;
+      // 授权等待优先展示；提问/计划确认的旧文案不再保留。
+      run.askKind = null;
+      run.askText = "";
       let text = "等待授权：" + (run.waitingTool || "未知工具");
       if (run.waitingPath) text += " · " + basename(run.waitingPath);
       run.activity = clip(text, ACTIVITY_LIMIT);
@@ -1023,6 +1205,8 @@ export function ingestAfterTurn(state, payload, nowMs) {
   run.lastEventAt = occurredAt;
   run.waitingTool = null;
   run.waitingPath = null;
+  run.askKind = null;
+  run.askText = "";
   if (status === "failed") {
     const message = payload.error === null || payload.error === undefined ? "" : payload.error;
     if (message) run.error = clip(message, ERROR_STORE_LIMIT);
@@ -1058,6 +1242,8 @@ function createExternalRun(record, nowMs) {
     activity: "手机或其他客户端发起",
     waitingTool: null,
     waitingPath: null,
+    askKind: null,
+    askText: "",
     error: "",
     endedAt: null,
     read: false,
@@ -1127,6 +1313,8 @@ export function applyExternalRuns(state, records, nowMs) {
         existing.phase = "running";
         existing.endedAt = null;
         existing.activity = "手机或其他客户端发起";
+        existing.askKind = null;
+        existing.askText = "";
         changed = true;
       }
       if (!existing.sessionId && isText(record.sessionId)) {
@@ -1148,17 +1336,93 @@ export function applyExternalRuns(state, records, nowMs) {
   }
 
   // 进程消失 = 轮次结束（键按进程实例，pid 复用也不会误续）。
-  // 外部轮次看不到退出码，只能给中性的「已结束」。
+  // 外部轮次看不到退出码，只能给中性的「已结束」。待回复也是活动态：
+  // 手机端提问后进程退出，同样要收尾，不能停在「待回复」。
   for (const run of Array.from(state.runs.values())) {
     if (run.source !== "external") continue;
-    if (run.phase !== "running") continue;
+    if (run.phase !== "running" && run.phase !== "asking") continue;
     if (liveKeys.has(run.key)) continue;
     run.phase = "ended";
     run.endedAt = now;
     run.activity = "外部轮次已结束";
+    run.askKind = null;
+    run.askText = "";
     changed = true;
   }
 
+  return changed;
+}
+
+// ---- 待回复（转录探测） ----
+
+// 需要探测的会话：只有 claude 的转录格式是已知的；只探测仍在活动（运行中 /
+// 已判定待回复）且已有会话标识的轮次——终态、等待授权、收尾中的轮次不需要。
+export function collectQuestionTargets(state) {
+  const ids = [];
+  if (!state || !state.runs) return ids;
+  for (const run of state.runs.values()) {
+    if (run.engine !== "claude" || !isText(run.sessionId)) continue;
+    if (run.phase !== "running" && run.phase !== "asking") continue;
+    if (ids.indexOf(run.sessionId) >= 0) continue;
+    ids.push(run.sessionId);
+    if (ids.length >= QUESTION_TARGET_CAP) break;
+  }
+  return ids;
+}
+
+// 应用一次成功的转录探测结果。rows 里没有的会话保持现状：「没读到」不等于「已回复」。
+export function applyQuestionStates(state, rows) {
+  if (!state || !state.runs || !Array.isArray(rows)) return false;
+  const bySession = new Map();
+  for (const row of rows) {
+    if (!row || !isText(row.sessionId)) continue;
+    const kind = row.kind === "plan" ? "plan" : row.kind === "question" ? "question" : "";
+    bySession.set(row.sessionId, {
+      pending: row.pending === true,
+      kind,
+      text: isText(row.text) ? clip(collapseSpace(row.text), QUESTION_TEXT_LIMIT) : "",
+    });
+  }
+  if (bySession.size === 0) return false;
+
+  let changed = false;
+  for (const run of state.runs.values()) {
+    if (run.engine !== "claude" || !isText(run.sessionId)) continue;
+    const info = bySession.get(run.sessionId);
+    if (!info) continue;
+    if (TERMINAL_PHASES.has(run.phase) || run.phase === "settling") continue;
+
+    if (info.pending) {
+      // 等待授权是更高优先级的阻塞状态，不用待回复覆盖。
+      if (run.phase !== "running" && run.phase !== "asking") continue;
+      // kind 缺省按提问处理；比较也用归一化后的值，避免每轮探测都判定为「有变化」。
+      const nextKind = info.kind === "plan" ? "plan" : "question";
+      const activity = clip(
+        (nextKind === "plan" ? "等待你批准计划" : "等待你回答") + (info.text ? "：" + info.text : ""),
+        ACTIVITY_LIMIT
+      );
+      if (run.phase !== "asking" || run.askKind !== nextKind || run.askText !== info.text) {
+        run.phase = "asking";
+        run.askKind = nextKind;
+        run.askText = info.text;
+        run.activity = activity;
+        changed = true;
+      }
+      continue;
+    }
+
+    if (run.phase === "asking") {
+      run.phase = "running";
+      run.askKind = null;
+      run.askText = "";
+      run.activity = "已收到回复，继续执行";
+      changed = true;
+    } else if (run.askKind !== null || run.askText !== "") {
+      run.askKind = null;
+      run.askText = "";
+      changed = true;
+    }
+  }
   return changed;
 }
 
@@ -1217,6 +1481,7 @@ export function markCardRead(state, cardKey) {
 
 function aggregatePhase(runs) {
   let hasWaiting = false;
+  let hasAsking = false;
   let hasRunning = false;
   let hasSettling = false;
   let hasFailed = false;
@@ -1224,13 +1489,16 @@ function aggregatePhase(runs) {
   let hasEnded = false;
   for (const run of runs) {
     if (run.phase === "waiting") hasWaiting = true;
+    else if (run.phase === "asking") hasAsking = true;
     else if (run.phase === "running") hasRunning = true;
     else if (run.phase === "settling") hasSettling = true;
     else if (run.phase === "failed") hasFailed = true;
     else if (run.phase === "cancelled") hasCancelled = true;
     else if (run.phase === "ended") hasEnded = true;
   }
+  // 两种「卡在用户身上」的状态优先展示：等待授权 > 待回复 > 运行中。
   if (hasWaiting) return "waiting";
+  if (hasAsking) return "asking";
   if (hasRunning) return "running";
   if (hasSettling) return "settling";
   if (hasFailed) return "failed";
@@ -1240,7 +1508,7 @@ function aggregatePhase(runs) {
 }
 
 function phaseBucket(phase) {
-  if (phase === "waiting") return 0;
+  if (phase === "waiting" || phase === "asking") return 0;
   if (phase === "running") return 1;
   if (phase === "settling") return 2;
   return 3;
@@ -1265,6 +1533,7 @@ export function deriveCards(state, nowMs) {
   for (const [key, runs] of groups) {
     let latest = runs[0];
     let waitingRun = null;
+    let askingRun = null;
     let activeLatest = null;
     let activeStartedAt = Infinity;
     let startedAt = Infinity;
@@ -1281,11 +1550,12 @@ export function deriveCards(state, nowMs) {
         if (!activeLatest || run.lastEventAt > activeLatest.lastEventAt) activeLatest = run;
       }
       if (run.phase === "waiting" && (!waitingRun || run.lastEventAt > waitingRun.lastEventAt)) waitingRun = run;
+      if (run.phase === "asking" && (!askingRun || run.lastEventAt > askingRun.lastEventAt)) askingRun = run;
     }
 
     const phase = aggregatePhase(runs);
     // 状态与活动文案都取活跃轮次，避免「运行中」配上已终态轮的「本轮输出完成」。
-    const representative = waitingRun || activeLatest || latest;
+    const representative = waitingRun || askingRun || activeLatest || latest;
     const elapsedStart = activeLatest ? activeStartedAt : startedAt;
     const frozen = phase === "settling" || TERMINAL_PHASES.has(phase);
     const elapsedEnd = frozen ? (endedAt === null ? now : endedAt) : now;
@@ -1308,6 +1578,11 @@ export function deriveCards(state, nowMs) {
         "等待授权：" +
         representative.waitingTool +
         (representative.waitingPath ? " · " + representative.waitingPath : "");
+    }
+    if (representative.phase === "asking" && representative.askText) {
+      // activity 里的提问文本按活动行长度截断过；悬停标题给完整的（上限 200）。
+      activityTitle =
+        (representative.askKind === "plan" ? "等待你批准计划：" : "等待你回答：") + representative.askText;
     }
 
     const sessionId = runs[0].sessionId || null;
@@ -1382,6 +1657,15 @@ export function countActiveRuns(state) {
   let count = 0;
   for (const run of state.runs.values()) {
     if (ACTIVE_PHASES.has(run.phase)) count += 1;
+  }
+  return count;
+}
+
+export function countAskingRuns(state) {
+  if (!state || !state.runs) return 0;
+  let count = 0;
+  for (const run of state.runs.values()) {
+    if (run.phase === "asking") count += 1;
   }
   return count;
 }
@@ -1472,6 +1756,12 @@ export function createSessionStore(options) {
     // 进程探测结果（只在探测成功时调用）。
     applyExternalRuns(records, nowMs) {
       const changed = applyExternalRuns(state, records, nowMs);
+      commit(changed);
+      return changed;
+    },
+    // 转录探测结果（只在探测成功时调用）；rows 里没有的会话保持现状。
+    applyQuestionStates(rows) {
+      const changed = applyQuestionStates(state, rows);
       commit(changed);
       return changed;
     },
@@ -1695,6 +1985,81 @@ export default function activate(ctx) {
   function handleExternalVisibility() {
     if (typeof document === "undefined" || document.visibilityState === "hidden") return;
     requestExternalRefresh();
+    requestQuestionRefresh();
+  }
+
+  // ---- 待回复：面板打开时读 Claude 转录尾部（提问 / 计划审批） ----
+  const questionSync = { timer: null, busy: false, lastAt: 0, failures: 0, disposed: false };
+
+  function questionNextDelay() {
+    if (questionSync.failures === 0) return QUESTION_POLL_MS;
+    return Math.min(QUESTION_POLL_MS * Math.pow(2, questionSync.failures), EXTERNAL_POLL_MAX_BACKOFF_MS);
+  }
+
+  function scheduleQuestionSync(delay) {
+    if (questionSync.disposed || !canFetchTitles || questionSync.timer !== null) return;
+    // 面板没打开就不探测：待回复只在面板里展示，没必要为看不见的界面 spawn 子进程。
+    if (!store.hasSubscribers()) return;
+    if (collectQuestionTargets(store.state).length === 0) return;
+    const wait = typeof delay === "number" && delay >= 0 ? delay : questionNextDelay();
+    questionSync.timer = setTimeout(() => {
+      questionSync.timer = null;
+      void syncQuestions();
+    }, wait);
+  }
+
+  // 面板打开 / 回到前台：数据确实陈旧才立刻补探一次；失败退避期间不插队。
+  function requestQuestionRefresh() {
+    if (questionSync.disposed || !canFetchTitles || !store.hasSubscribers()) return;
+    if (collectQuestionTargets(store.state).length === 0) return;
+    if (questionSync.failures > 0) return;
+    const fresh = Date.now() - questionSync.lastAt < QUESTION_REFRESH_STALE_MS;
+    if (!fresh && questionSync.timer !== null) {
+      clearTimeout(questionSync.timer);
+      questionSync.timer = null;
+    }
+    if (questionSync.timer === null) scheduleQuestionSync(fresh ? undefined : 0);
+  }
+
+  async function queryQuestionStates(ids) {
+    const result = await ctx.bridge.invoke("plugin_exec_run", {
+      bin: "node",
+      args: ["-e", QUESTION_PROBE_SCRIPT, JSON.stringify(ids)],
+      timeoutMs: QUESTION_FETCH_TIMEOUT_MS,
+    });
+    if (!result || result.code !== 0 || typeof result.stdout !== "string") return null;
+    let rows;
+    try {
+      rows = JSON.parse(result.stdout);
+    } catch {
+      return null;
+    }
+    return Array.isArray(rows) ? rows : null;
+  }
+
+  async function syncQuestions() {
+    if (!canFetchTitles || questionSync.disposed || questionSync.busy) return;
+    if (!store.hasSubscribers()) return;
+    const ids = collectQuestionTargets(store.state);
+    if (ids.length === 0) return;
+    questionSync.busy = true;
+    let rows = null;
+    try {
+      rows = await queryQuestionStates(ids);
+    } catch {
+      rows = null;
+    } finally {
+      questionSync.busy = false;
+    }
+    if (questionSync.disposed) return;
+    if (rows === null) {
+      questionSync.failures = Math.min(questionSync.failures + 1, 5);
+    } else {
+      questionSync.failures = 0;
+      questionSync.lastAt = Date.now();
+      store.applyQuestionStates(rows);
+    }
+    scheduleQuestionSync();
   }
 
   const canListenVisibility =
@@ -1773,15 +2138,17 @@ export default function activate(ctx) {
       []
     );
 
-    // 面板一打开就补一次标题（页面重载后内存缓存为空），并补一次进程探测。
+    // 面板一打开就补一次标题（页面重载后内存缓存为空），并补一次进程探测与提问探测。
     useEffect(() => {
       scheduleTitleSync(0);
       requestExternalRefresh();
+      requestQuestionRefresh();
     }, []);
 
     const nowMs = Date.now();
     const cards = deriveCards(store.state, nowMs);
     const activeCount = countActiveRuns(store.state);
+    const askingCount = countAskingRuns(store.state);
 
     function dismissError() {
       if (bannerTimerRef.current !== null) {
@@ -1828,8 +2195,13 @@ export default function activate(ctx) {
       const disabled = cannotOpen || blocked;
       const statusColor = STATUS_COLORS[card.phase] || TEXT_TERTIARY;
       const statusTextColor = card.phase === "failed" ? TEXT_ERROR : TEXT_SECONDARY;
-      // 等待动画不用 keyframes：tick 每秒切换圆点 opacity。
-      const dotOpacity = card.phase === "waiting" ? (Math.floor(nowMs / 1000) % 2 === 0 ? 0.45 : 1) : 1;
+      // 等待动画不用 keyframes：tick 每秒切换圆点 opacity（等待授权 / 待回复都呼吸）。
+      const dotOpacity =
+        card.phase === "waiting" || card.phase === "asking"
+          ? Math.floor(nowMs / 1000) % 2 === 0
+            ? 0.45
+            : 1
+          : 1;
       const cardTitle = cannotOpen
         ? "会话标识尚未建立，暂时无法跳转"
         : blocked
@@ -1952,6 +2324,7 @@ export default function activate(ctx) {
           { style: S.titleRow },
           h("span", { style: S.title }, "运行中会话"),
           h("span", { style: S.countChip }, activeCount + " 个运行中"),
+          askingCount > 0 ? h("span", { style: S.askingChip }, askingCount + " 个待回复") : null,
           h("span", { style: S.scopeChip }, "全部项目 · 含外部客户端")
         )
       ),
@@ -1994,7 +2367,11 @@ export default function activate(ctx) {
         "div",
         { style: S.footer },
         h("div", { style: S.footerLine }, "更新于 " + formatClock(store.getLastChangedAt()) + " · 所有项目 · 含外部客户端"),
-        h("div", { style: S.footerNote }, "「外部」轮次按引擎进程推断，只区分运行/结束；插件加载前已结束的轮次不会显示")
+        h(
+          "div",
+          { style: S.footerNote },
+          "「外部」轮次按引擎进程推断，只区分运行/结束；「待回复」按 Claude 转录尾部推断（约 10 秒内更新）；插件加载前已结束的轮次不会显示"
+        )
       )
     );
   }
@@ -2004,10 +2381,13 @@ export default function activate(ctx) {
     onTurnStarted: (payload) => {
       store.turnStarted(payload);
       scheduleTitleSync();
+      // 新轮次可能马上进入提问：面板打开时提前补一次探测（面板没开时自动跳过）。
+      scheduleQuestionSync(1500);
     },
     onRuntimeEvent: (payload) => {
       store.runtimeEvent(payload);
       if (payload && isText(payload.sessionId)) scheduleTitleSync();
+      scheduleQuestionSync(1500);
     },
     afterTurn: (payload) => {
       store.turnFinished(payload);
@@ -2026,6 +2406,7 @@ export default function activate(ctx) {
   // 这里只清理插件自建的计时器与订阅。
   return () => {
     externalSync.disposed = true;
+    questionSync.disposed = true;
     if (titleSync.timer !== null) {
       clearTimeout(titleSync.timer);
       titleSync.timer = null;
@@ -2033,6 +2414,10 @@ export default function activate(ctx) {
     if (externalSync.timer !== null) {
       clearTimeout(externalSync.timer);
       externalSync.timer = null;
+    }
+    if (questionSync.timer !== null) {
+      clearTimeout(questionSync.timer);
+      questionSync.timer = null;
     }
     if (canFetchTitles && canListenVisibility) document.removeEventListener("visibilitychange", handleExternalVisibility);
     if (titlePollTimer !== null) clearInterval(titlePollTimer);
