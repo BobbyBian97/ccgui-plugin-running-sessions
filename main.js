@@ -1609,7 +1609,7 @@ export default function activate(ctx) {
   // ---- 外部轮次：探测 ccgui 子进程里的引擎 CLI（手机 / 其他客户端发起的轮次） ----
   // 宿主只为本窗口发起的轮次派发 turn hooks，外部轮次没有生命周期；这里用
   // exec 授权枚举进程补上开跑/结束信号（结果只是进程级，比 hook 轮次粗）。
-  const externalSync = { timer: null, busy: false, lastAt: 0, failures: 0 };
+  const externalSync = { timer: null, busy: false, lastAt: 0, failures: 0, disposed: false };
 
   function externalNextDelay() {
     const base = store.hasSubscribers() ? EXTERNAL_POLL_VISIBLE_MS : EXTERNAL_POLL_IDLE_MS;
@@ -1618,7 +1618,7 @@ export default function activate(ctx) {
   }
 
   function scheduleExternalPoll(delay) {
-    if (!canFetchTitles || externalSync.timer !== null) return;
+    if (externalSync.disposed || !canFetchTitles || externalSync.timer !== null) return;
     const wait = typeof delay === "number" && delay >= 0 ? delay : externalNextDelay();
     externalSync.timer = setTimeout(() => {
       externalSync.timer = null;
@@ -1668,6 +1668,7 @@ export default function activate(ctx) {
     } finally {
       externalSync.busy = false;
     }
+    if (externalSync.disposed) return;
     if (rows === null) {
       // 非 Windows / 没有 Node / 授权被拒：指数退避，不刷屏。
       externalSync.failures = Math.min(externalSync.failures + 1, 5);
@@ -2013,6 +2014,7 @@ export default function activate(ctx) {
   // 注册返回的 Disposer 由宿主在卸载时逆序自动执行（SDK 契约）；
   // 这里只清理插件自建的计时器与订阅。
   return () => {
+    externalSync.disposed = true;
     if (titleSync.timer !== null) {
       clearTimeout(titleSync.timer);
       titleSync.timer = null;
